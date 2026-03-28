@@ -2,7 +2,7 @@ use std::{
     ffi::{CStr, c_char},
     io,
     os::windows::{ffi::OsStrExt, io::AsRawHandle, process::ChildExt as _},
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
@@ -54,11 +54,14 @@ impl PathAccessIterable {
 #[derive(Debug, Clone)]
 pub struct SpyImpl {
     ansi_dll_path_with_nul: Arc<CStr>,
+    dll_dir: PathBuf,
+    dll_path: PathBuf,
 }
 
 impl SpyImpl {
     pub fn init_in(path: &Path) -> io::Result<Self> {
         let dll_path = INTERPOSE_CDYLIB.write_to(path, ".dll").unwrap();
+        let dll_dir = path.to_path_buf();
 
         let wide_dll_path = dll_path.as_os_str().encode_wide().collect::<Vec<u16>>();
         let mut ansi_dll_path =
@@ -70,7 +73,11 @@ impl SpyImpl {
         // SAFETY: we just pushed a NUL byte, so the slice is NUL-terminated
         let ansi_dll_path_with_nul =
             unsafe { CStr::from_bytes_with_nul_unchecked(ansi_dll_path.as_slice()) };
-        Ok(Self { ansi_dll_path_with_nul: ansi_dll_path_with_nul.into() })
+        Ok(Self {
+            ansi_dll_path_with_nul: ansi_dll_path_with_nul.into(),
+            dll_dir,
+            dll_path,
+        })
     }
 
     #[expect(clippy::unused_async, reason = "async signature required by SpyImpl trait")]
@@ -81,6 +88,9 @@ impl SpyImpl {
     ) -> Result<TrackedChild, SpawnError> {
         let ansi_dll_path_with_nul = Arc::clone(&self.ansi_dll_path_with_nul);
         command.env("FSPY", "1");
+
+        let app_container_sid = command.app_container_sid.take();
+
         let mut command = command.into_tokio_command();
 
         command.creation_flags(CREATE_SUSPENDED);
@@ -88,11 +98,67 @@ impl SpyImpl {
         let (channel_conf, receiver) =
             channel(SHM_CAPACITY).map_err(SpawnError::ChannelCreation)?;
 
+        if let Some(sid) = app_container_sid {
+            unsafe { channel_conf.grant_appcontainer_access(sid) }
+                .map_err(SpawnError::ChannelCreation)?;
+
+            // The preload DLL and its parent directory must be readable by the
+            // AppContainer process so the Windows loader can map the DLL.
+            use fspy_shared::ipc::channel::win_acl;
+            let read_execute: u32 = 0x8000_0000 | 0x2000_0000; // GENERIC_READ | GENERIC_EXECUTE
+            win_acl::grant_file_access_with_mask(
+                self.dll_dir.as_os_str(),
+                sid,
+                read_execute,
+            )
+            .map_err(SpawnError::ChannelCreation)?;
+            win_acl::grant_file_access_with_mask(
+                self.dll_path.as_os_str(),
+                sid,
+                read_execute,
+            )
+            .map_err(SpawnError::ChannelCreation)?;
+        }
+
         let mut spawn_success = false;
         let spawn_success = &mut spawn_success;
         let mut child = command
             .spawn_with(|std_command| {
-                let std_child = std_command.spawn()?;
+                let std_child = if let Some(sid) = app_container_sid {
+                    use std::os::windows::process::{CommandExt as _, ProcThreadAttributeList};
+
+                    #[repr(C)]
+                    struct SecurityCapabilities {
+                        app_container_sid: *mut core::ffi::c_void,
+                        capabilities: *mut core::ffi::c_void,
+                        capability_count: u32,
+                        reserved: u32,
+                    }
+
+                    const PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES: usize = 0x00020009;
+                    let caps = SecurityCapabilities {
+                        app_container_sid: sid,
+                        capabilities: std::ptr::null_mut(),
+                        capability_count: 0,
+                        reserved: 0,
+                    };
+                    // SAFETY: `sid` is a valid AppContainer SID whose lifetime is managed
+                    // by the caller (safety contract of `Command::app_container_sid`).
+                    // `caps` is a well-formed SECURITY_CAPABILITIES struct.
+                    let attribute_list = unsafe {
+                        ProcThreadAttributeList::build()
+                            .raw_attribute(
+                                PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+                                &caps as *const SecurityCapabilities as *const core::ffi::c_void,
+                                std::mem::size_of::<SecurityCapabilities>(),
+                            )
+                            .finish()
+                            .map_err(io::Error::other)?
+                    };
+                    std_command.spawn_with_attributes(&attribute_list)?
+                } else {
+                    std_command.spawn()?
+                };
                 *spawn_success = true;
 
                 let mut dll_paths = ansi_dll_path_with_nul.as_ptr().cast::<c_char>();

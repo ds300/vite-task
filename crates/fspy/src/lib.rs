@@ -1,4 +1,10 @@
-#![cfg_attr(target_os = "windows", feature(windows_process_extensions_main_thread_handle))]
+#![cfg_attr(
+    target_os = "windows",
+    feature(
+        windows_process_extensions_main_thread_handle,
+        windows_process_extensions_raw_attribute,
+    )
+)]
 #![feature(once_cell_try)]
 
 // Persist the injected DLL/shared library somewhere in the filesystem.

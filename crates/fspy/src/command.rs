@@ -28,6 +28,9 @@ pub struct Command {
     #[cfg(unix)]
     #[debug("({} pre_exec closures)", pre_exec_closures.len())]
     pre_exec_closures: Vec<Box<dyn FnMut() -> std::io::Result<()> + Send + Sync>>,
+
+    #[cfg(windows)]
+    pub(crate) app_container_sid: Option<*mut core::ffi::c_void>,
 }
 
 impl Command {
@@ -47,6 +50,8 @@ impl Command {
             stdin: None,
             #[cfg(unix)]
             pre_exec_closures: Vec::new(),
+            #[cfg(windows)]
+            app_container_sid: None,
         }
     }
 
@@ -223,6 +228,25 @@ impl Command {
         F: FnMut() -> std::io::Result<()> + Send + Sync + 'static,
     {
         self.pre_exec_closures.push(Box::new(f));
+        self
+    }
+
+    /// Run the traced process inside a Windows AppContainer sandbox.
+    ///
+    /// The AppContainer SID is passed as a `SECURITY_CAPABILITIES` proc thread
+    /// attribute to `CreateProcessW`, confining the child's filesystem and
+    /// network access. This composes with fspy's Detours DLL injection: the
+    /// process is created suspended with both the AppContainer attribute and
+    /// `CREATE_SUSPENDED`, the DLL is injected, then the thread is resumed.
+    ///
+    /// # Safety
+    ///
+    /// `sid` must point to a valid AppContainer SID (allocated via
+    /// `CreateAppContainerProfile` or `DeriveAppContainerSidFromAppContainerName`)
+    /// that remains valid until [`Command::spawn`] returns.
+    #[cfg(windows)]
+    pub unsafe fn app_container_sid(&mut self, sid: *mut core::ffi::c_void) -> &mut Self {
+        self.app_container_sid = Some(sid);
         self
     }
 

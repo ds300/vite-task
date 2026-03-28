@@ -1,6 +1,8 @@
 //! Fast mpsc IPC channel implementation based on shared memory.
 
 mod shm_io;
+#[cfg(target_os = "windows")]
+pub mod win_acl;
 
 use std::{env::temp_dir, fs::File, io, ops::Deref, path::PathBuf, sync::Arc};
 
@@ -54,6 +56,25 @@ pub fn channel(capacity: usize) -> io::Result<(ChannelConf, Receiver)> {
 }
 
 impl ChannelConf {
+    /// Grant an AppContainer SID access to the shared memory section and lock file.
+    ///
+    /// Must be called by the parent (outside the AppContainer) before the child
+    /// process (inside the AppContainer) tries to connect via `sender()`.
+    ///
+    /// # Safety
+    ///
+    /// `sid` must point to a valid AppContainer SID that remains valid for the
+    /// duration of this call.
+    #[cfg(target_os = "windows")]
+    pub unsafe fn grant_appcontainer_access(
+        &self,
+        sid: *mut core::ffi::c_void,
+    ) -> io::Result<()> {
+        win_acl::grant_section_access(&self.shm_id, sid)?;
+        win_acl::grant_file_access(&self.lock_file_path.to_cow_os_str(), sid)?;
+        Ok(())
+    }
+
     /// Creates a sender.
     ///
     /// This doesn't block on the file lock. Instead it returns immediately with error if the receiver is locked or dropped.
