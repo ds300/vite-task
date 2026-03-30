@@ -28,6 +28,14 @@ pub struct Command {
     #[cfg(unix)]
     #[debug("({} pre_exec closures)", pre_exec_closures.len())]
     pre_exec_closures: Vec<Box<dyn FnMut() -> std::io::Result<()> + Send + Sync>>,
+
+    /// Optional token handle for launching the child process with a restricted
+    /// token on Windows. When set, `CreateProcessAsUserW` is used instead of
+    /// `CreateProcessW`, allowing the child to run with a different security
+    /// context (e.g., a restricted token with deny-only SIDs).
+    #[cfg(windows)]
+    #[debug(skip)]
+    pub(crate) raw_token: Option<std::os::windows::io::RawHandle>,
 }
 
 impl Command {
@@ -45,6 +53,8 @@ impl Command {
             stderr: None,
             stdout: None,
             stdin: None,
+            #[cfg(windows)]
+            raw_token: None,
             #[cfg(unix)]
             pre_exec_closures: Vec::new(),
         }
@@ -110,6 +120,15 @@ impl Command {
 
     pub fn stdin<T: Into<Stdio>>(&mut self, cfg: T) -> &mut Self {
         self.stdin = Some(cfg.into());
+        self
+    }
+
+    /// Set a raw token handle for launching the child process on Windows.
+    /// When set, `CreateProcessAsUserW` is used instead of `CreateProcessW`,
+    /// allowing the child to run with a restricted token.
+    #[cfg(windows)]
+    pub fn raw_token(&mut self, token: std::os::windows::io::RawHandle) -> &mut Self {
+        self.raw_token = Some(token);
         self
     }
 

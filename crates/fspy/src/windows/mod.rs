@@ -80,6 +80,7 @@ impl SpyImpl {
         cancellation_token: CancellationToken,
     ) -> Result<TrackedChild, SpawnError> {
         let ansi_dll_path_with_nul = Arc::clone(&self.ansi_dll_path_with_nul);
+        let raw_token = command.raw_token.take();
         command.env("FSPY", "1");
         let mut command = command.into_tokio_command();
 
@@ -95,44 +96,15 @@ impl SpyImpl {
                 let std_child = std_command.spawn()?;
                 *spawn_success = true;
 
-                let mut dll_paths = ansi_dll_path_with_nul.as_ptr().cast::<c_char>();
-                let process_handle = std_child.as_raw_handle().cast::<winapi::ctypes::c_void>();
-                // SAFETY: process_handle is a valid handle to the just-spawned child process,
-                // dll_paths points to a valid null-terminated ANSI string
-                let success =
-                    unsafe { DetourUpdateProcessWithDll(process_handle, &raw mut dll_paths, 1) };
-                if success != TRUE {
-                    return Err(io::Error::last_os_error());
+                // If a token was provided, swap the process's primary token
+                // BEFORE resuming the main thread. NtSetInformationProcess with
+                // ProcessAccessToken works only when no threads have run yet
+                // (the process is CREATE_SUSPENDED).
+                if let Some(token) = raw_token {
+                    set_process_token(&std_child, token)?;
                 }
 
-                let payload = Payload {
-                    channel_conf: channel_conf.clone(),
-                    ansi_dll_path_with_nul: ansi_dll_path_with_nul.to_bytes(),
-                };
-                let payload_bytes = bincode::encode_to_vec(payload, BINCODE_CONFIG).unwrap();
-                // SAFETY: process_handle is valid, PAYLOAD_ID is a static GUID,
-                // payload_bytes is a valid buffer with correct length
-                let success = unsafe {
-                    DetourCopyPayloadToProcess(
-                        process_handle,
-                        &PAYLOAD_ID,
-                        payload_bytes.as_ptr().cast(),
-                        payload_bytes.len().try_into().unwrap(),
-                    )
-                };
-                if success != TRUE {
-                    return Err(io::Error::last_os_error());
-                }
-
-                let main_thread_handle = std_child.main_thread_handle();
-                // SAFETY: main_thread_handle is a valid thread handle from the spawned child
-                let resume_thread_ret =
-                    unsafe { ResumeThread(main_thread_handle.as_raw_handle().cast()) }
-                        .cast_signed();
-
-                if resume_thread_ret == -1 {
-                    return Err(io::Error::last_os_error());
-                }
+                inject_and_resume(&std_child, &ansi_dll_path_with_nul, &channel_conf)?;
 
                 Ok(std_child)
             })
@@ -176,5 +148,101 @@ impl SpyImpl {
             .map(|f| f?) // flatten JoinError and io::Result
             .boxed(),
         })
+    }
+}
+
+/// Inject the Detours DLL, copy the IPC payload, and resume the main thread.
+fn inject_and_resume(
+    std_child: &std::process::Child,
+    ansi_dll_path_with_nul: &CStr,
+    channel_conf: &fspy_shared::ipc::channel::ChannelConf,
+) -> io::Result<()> {
+    let mut dll_paths = ansi_dll_path_with_nul.as_ptr().cast::<c_char>();
+    let process_handle = std_child.as_raw_handle().cast::<winapi::ctypes::c_void>();
+
+    let success =
+        unsafe { DetourUpdateProcessWithDll(process_handle, &raw mut dll_paths, 1) };
+    if success != TRUE {
+        return Err(io::Error::last_os_error());
+    }
+
+    let payload = Payload {
+        channel_conf: channel_conf.clone(),
+        ansi_dll_path_with_nul: ansi_dll_path_with_nul.to_bytes(),
+    };
+    let payload_bytes = bincode::encode_to_vec(payload, BINCODE_CONFIG).unwrap();
+    let success = unsafe {
+        DetourCopyPayloadToProcess(
+            process_handle,
+            &PAYLOAD_ID,
+            payload_bytes.as_ptr().cast(),
+            payload_bytes.len().try_into().unwrap(),
+        )
+    };
+    if success != TRUE {
+        return Err(io::Error::last_os_error());
+    }
+
+    let main_thread_handle = std_child.main_thread_handle();
+    let resume_thread_ret =
+        unsafe { ResumeThread(main_thread_handle.as_raw_handle().cast()) }
+            .cast_signed();
+    if resume_thread_ret == -1 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(())
+}
+
+/// Replace a suspended process's primary token using `NtSetInformationProcess`.
+///
+/// This must be called BEFORE any thread in the process has been resumed.
+/// `NtSetInformationProcess(ProcessAccessToken)` is the only way to change
+/// a process's primary token after creation — `SetTokenInformation` doesn't
+/// support this.
+fn set_process_token(
+    child: &std::process::Child,
+    token: std::os::windows::io::RawHandle,
+) -> io::Result<()> {
+    // ProcessAccessToken = 9
+    const PROCESS_ACCESS_TOKEN: u32 = 9;
+
+    #[repr(C)]
+    struct ProcessAccessTokenInfo {
+        token: *mut core::ffi::c_void,
+        thread: *mut core::ffi::c_void, // must be NULL
+    }
+
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtSetInformationProcess(
+            ProcessHandle: *mut core::ffi::c_void,
+            ProcessInformationClass: u32,
+            ProcessInformation: *const core::ffi::c_void,
+            ProcessInformationLength: u32,
+        ) -> i32; // NTSTATUS
+    }
+
+    let info = ProcessAccessTokenInfo {
+        token: token.cast(),
+        thread: std::ptr::null_mut(),
+    };
+
+    let process_handle = child.as_raw_handle().cast();
+    let status = unsafe {
+        NtSetInformationProcess(
+            process_handle,
+            PROCESS_ACCESS_TOKEN,
+            &info as *const _ as *const _,
+            std::mem::size_of::<ProcessAccessTokenInfo>() as u32,
+        )
+    };
+
+    if status < 0 {
+        Err(io::Error::from_raw_os_error(
+            winapi::shared::ntstatus::STATUS_ACCESS_DENIED, // approximate
+        ))
+    } else {
+        Ok(())
     }
 }
